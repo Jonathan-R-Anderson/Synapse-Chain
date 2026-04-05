@@ -1,0 +1,13 @@
+{
+  "node_name": "demo-bootnode",
+  "node_types": ["bootnode"],
+  "sync_mode": "discovery",
+  "pruning_enabled": true,
+  "snapshot_interval": 8,
+  "max_peers": 16,
+  "state_directory": "./.demo/bootnode",
+  "serve_state": false,
+  "serve_blocks": false,
+  "history_retention": 16,
+  "prune_depth": 16
+}

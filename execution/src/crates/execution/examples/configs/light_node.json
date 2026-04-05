@@ -1,0 +1,13 @@
+{
+  "node_name": "demo-light",
+  "node_types": ["light"],
+  "sync_mode": "light",
+  "pruning_enabled": true,
+  "snapshot_interval": 8,
+  "max_peers": 8,
+  "state_directory": "./.demo/light",
+  "serve_state": false,
+  "serve_blocks": false,
+  "history_retention": 16,
+  "prune_depth": 16
+}

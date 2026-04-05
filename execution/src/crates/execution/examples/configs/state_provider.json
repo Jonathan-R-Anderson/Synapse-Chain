@@ -1,0 +1,13 @@
+{
+  "node_name": "demo-state-provider",
+  "node_types": ["full", "state_provider", "snapshot_generator"],
+  "sync_mode": "full",
+  "pruning_enabled": true,
+  "snapshot_interval": 2,
+  "max_peers": 8,
+  "state_directory": "./.demo/state-provider",
+  "serve_state": true,
+  "serve_blocks": true,
+  "history_retention": 64,
+  "prune_depth": 64
+}

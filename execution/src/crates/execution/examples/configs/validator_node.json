@@ -1,0 +1,13 @@
+{
+  "node_name": "demo-validator",
+  "node_types": ["full", "validator"],
+  "sync_mode": "full",
+  "pruning_enabled": true,
+  "snapshot_interval": 2,
+  "max_peers": 8,
+  "state_directory": "./.demo/validator",
+  "serve_state": false,
+  "serve_blocks": false,
+  "history_retention": 64,
+  "prune_depth": 64
+}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "execution-evm"
+version = "0.1.0"
+description = "A modular Python EVM interpreter for Ethereum-compatible execution."
+requires-python = ">=3.13"
+dependencies = [
+  "execution-primitives>=0.1.0",
+  "execution-crypto>=0.1.0",
+  "execution-encoding>=0.1.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

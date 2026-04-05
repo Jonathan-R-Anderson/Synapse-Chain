@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "execution-block-processing"
+version = "0.1.0"
+description = "Ethereum-style transaction and block execution for the Python execution client."
+requires-python = ">=3.13"
+dependencies = [
+  "execution-primitives>=0.1.0",
+  "execution-crypto>=0.1.0",
+  "execution-encoding>=0.1.0",
+  "execution-state>=0.1.0",
+  "execution-zk>=0.1.0",
+  "execution-transactions>=0.1.0",
+  "execution-evm>=0.1.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

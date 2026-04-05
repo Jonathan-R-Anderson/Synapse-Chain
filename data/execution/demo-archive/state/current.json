@@ -1,0 +1,12 @@
+{
+  "accounts": [
+    {
+      "address": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "balance": 1000000,
+      "code": "0x",
+      "nonce": 0,
+      "storage": {}
+    }
+  ],
+  "state_root": "0xcfab777f534b3fcce74bba212295ee5fac166ca1a772dfcb6256c809e42940ef"
+}

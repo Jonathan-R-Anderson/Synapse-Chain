@@ -1,0 +1,21 @@
+{
+  "accounts": [
+    {
+      "address": "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+      "balance": 10,
+      "code": "0x",
+      "nonce": 0,
+      "storage": {}
+    },
+    {
+      "address": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "balance": 999990,
+      "code": "0x",
+      "nonce": 1,
+      "storage": {}
+    }
+  ],
+  "block_hash": "0x698588f9191d5f61f2e1d139e4d672792f265e350f99cda0a2f5f16a1ac31d33",
+  "height": 1,
+  "state_root": "0x99f09a7646a56f278a18e7f7dd2fe08b422c64850902399d4e5528b972367e80"
+}

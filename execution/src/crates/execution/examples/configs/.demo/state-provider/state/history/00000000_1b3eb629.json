@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "address": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "balance": 1000000,
+      "code": "0x",
+      "nonce": 0,
+      "storage": {}
+    }
+  ],
+  "block_hash": "0x1b3eb629f88b402a923282cd63134580adb282f3fac70ecbda522cc719c766c3",
+  "height": 0,
+  "state_root": "0xcfab777f534b3fcce74bba212295ee5fac166ca1a772dfcb6256c809e42940ef"
+}

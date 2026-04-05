@@ -1,0 +1,13 @@
+{
+  "node_name": "demo-archive",
+  "node_types": ["archive"],
+  "sync_mode": "archive",
+  "pruning_enabled": false,
+  "snapshot_interval": 2,
+  "max_peers": 8,
+  "state_directory": "./.demo/archive",
+  "serve_state": false,
+  "serve_blocks": false,
+  "history_retention": 128,
+  "prune_depth": 128
+}

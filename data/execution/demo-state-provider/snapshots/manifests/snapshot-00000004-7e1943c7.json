@@ -1,0 +1,20 @@
+{
+  "block_hash": "0x7e1943c75262840900e2de6e5d180bd291e01c91816c398d652e6f1172f74c61",
+  "block_height": 4,
+  "chunks": [
+    {
+      "chunk_hash": "0xa8a0244b9ef7b619835caec9611b83fa3adcf2f3c73d00608bc6fe4887570110",
+      "chunk_id": "00000000",
+      "compression": null,
+      "first_key": "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+      "last_key": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+      "record_count": 2,
+      "snapshot_id": "snapshot-00000004-7e1943c7"
+    }
+  ],
+  "compression": null,
+  "created_at": 4.0,
+  "manifest_hash": "0xf7a1ea36c62b66af634ad406a17f3c05ef8299a3920c4192d7a7a1f5a28e8a5f",
+  "snapshot_id": "snapshot-00000004-7e1943c7",
+  "state_root": "0x102b9a88aff739a6decf3b0f434d39978aa912cc59808deb54ba97dffb3f978e"
+}

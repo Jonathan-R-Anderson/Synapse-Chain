@@ -1,0 +1,61 @@
+{
+  "tests": {
+    "legacy_zero_fee_transfer": {
+      "fork": "berlin",
+      "environment": {
+        "coinbase": "0x0000000000000000000000000000000000000000",
+        "gas_limit": "0x1c9c380",
+        "number": "0xbadc0d",
+        "timestamp": "0x1",
+        "difficulty": "0x1",
+        "chain_id": 1
+      },
+      "pre_state": {
+        "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf": {
+          "nonce": "0x0",
+          "balance": "0x1000",
+          "code": "0x",
+          "storage": {}
+        },
+        "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf": {
+          "nonce": "0x0",
+          "balance": "0x0",
+          "code": "0x",
+          "storage": {}
+        }
+      },
+      "transactions": [
+        {
+          "tx_type": "legacy",
+          "secret_key": "0x1",
+          "nonce": "0x0",
+          "to": "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+          "gas_limit": "0x5208",
+          "gas_price": "0x0",
+          "value": "0x7b",
+          "data": "0x",
+          "chain_id": 1
+        }
+      ],
+      "expected": {
+        "success": true,
+        "gas_used": "0x5208",
+        "post_state": {
+          "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf": {
+            "nonce": "0x1",
+            "balance": "0xf85",
+            "code": "0x",
+            "storage": {}
+          },
+          "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf": {
+            "nonce": "0x0",
+            "balance": "0x7b",
+            "code": "0x",
+            "storage": {}
+          }
+        },
+        "logs": []
+      }
+    }
+  }
+}

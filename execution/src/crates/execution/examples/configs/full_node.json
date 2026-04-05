@@ -1,0 +1,13 @@
+{
+  "node_name": "demo-full",
+  "node_types": ["full"],
+  "sync_mode": "full",
+  "pruning_enabled": true,
+  "snapshot_interval": 2,
+  "max_peers": 8,
+  "state_directory": "./.demo/full",
+  "serve_state": false,
+  "serve_blocks": false,
+  "history_retention": 32,
+  "prune_depth": 32
+}

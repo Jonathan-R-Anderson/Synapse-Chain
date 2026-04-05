@@ -1,0 +1,114 @@
+services:
+  execution-rpc:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    env_file:
+      - .env
+    environment:
+      EXECUTION_RPC_HOST: "${EXECUTION_RPC_HOST}"
+      EXECUTION_RPC_PORT: "${EXECUTION_RPC_PORT}"
+      EXECUTION_CHAIN_ID: "${EXECUTION_CHAIN_ID}"
+      EXECUTION_MINING_MODE: "${EXECUTION_MINING_MODE}"
+      EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
+    ports:
+      - "${EXECUTION_RPC_PORT}:${EXECUTION_RPC_PORT}"
+    volumes:
+      - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
+    restart: unless-stopped
+
+  execution-full:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    env_file:
+      - .env
+    environment:
+      EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
+      EXECUTION_NODE_STATUS_INTERVAL: "${EXECUTION_NODE_STATUS_INTERVAL}"
+    command: ["python", "/app/execution/src/crates/execution/examples/container_node.py", "--mode", "full", "--keep-alive"]
+    volumes:
+      - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
+    restart: unless-stopped
+
+  execution-light:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    env_file:
+      - .env
+    environment:
+      EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
+      EXECUTION_NODE_STATUS_INTERVAL: "${EXECUTION_NODE_STATUS_INTERVAL}"
+    command: ["python", "/app/execution/src/crates/execution/examples/container_node.py", "--mode", "light", "--keep-alive"]
+    volumes:
+      - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
+    restart: unless-stopped
+
+  execution-archive:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    env_file:
+      - .env
+    environment:
+      EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
+      EXECUTION_NODE_STATUS_INTERVAL: "${EXECUTION_NODE_STATUS_INTERVAL}"
+    command: ["python", "/app/execution/src/crates/execution/examples/container_node.py", "--mode", "archive", "--keep-alive"]
+    volumes:
+      - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
+    restart: unless-stopped
+
+  execution-bootnode:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    env_file:
+      - .env
+    environment:
+      EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
+      EXECUTION_NODE_STATUS_INTERVAL: "${EXECUTION_NODE_STATUS_INTERVAL}"
+    command: ["python", "/app/execution/src/crates/execution/examples/container_node.py", "--mode", "bootnode", "--keep-alive"]
+    volumes:
+      - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
+    restart: unless-stopped
+
+  execution-state-provider:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    env_file:
+      - .env
+    environment:
+      EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
+      EXECUTION_NODE_STATUS_INTERVAL: "${EXECUTION_NODE_STATUS_INTERVAL}"
+    command: ["python", "/app/execution/src/crates/execution/examples/container_node.py", "--mode", "state-provider", "--keep-alive"]
+    volumes:
+      - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
+    restart: unless-stopped
+
+  execution-validator:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    env_file:
+      - .env
+    environment:
+      EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
+      EXECUTION_NODE_STATUS_INTERVAL: "${EXECUTION_NODE_STATUS_INTERVAL}"
+    command: ["python", "/app/execution/src/crates/execution/examples/container_node.py", "--mode", "validator", "--keep-alive"]
+    volumes:
+      - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
+    restart: unless-stopped
+
+  consensus-sim:
+    build:
+      context: .
+      dockerfile: consensus/Dockerfile
+    env_file:
+      - .env
+    environment:
+      CONSENSUS_VALIDATORS: "${CONSENSUS_VALIDATORS}"
+      CONSENSUS_EPOCHS: "${CONSENSUS_EPOCHS}"
+    profiles:
+      - consensus

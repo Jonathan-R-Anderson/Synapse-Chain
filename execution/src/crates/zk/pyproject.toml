@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "execution-zk"
+version = "0.1.0"
+description = "ZK proof abstractions for Ethereum-compatible transaction extensions."
+requires-python = ">=3.13"
+dependencies = ["execution-primitives>=0.1.0"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
