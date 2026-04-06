@@ -93,13 +93,14 @@ The RPC server listens on `http://127.0.0.1:${EXECUTION_RPC_PORT}` using values 
 
 ### `start.py` Command Modes
 
-`start.py` has four command modes:
+`start.py` has five command modes:
 
 | Command | What it does |
 | --- | --- |
 | `python3 start.py start <target>` | Starts one target, or multiple long-running execution services when `<target>` is `all`. |
 | `python3 start.py stop <target>` | Stops one target, or all long-running execution services when `<target>` is `all`. |
 | `python3 start.py logs <target>` | Shows logs for one target, or tails logs for all long-running execution services when `<target>` is `all`. |
+| `python3 start.py addresses <target>` | Reads the published I2P destinations for one target, or reports all long-running services when `<target>` is `all`. |
 | `python3 start.py ps` | Shows current Compose service status. |
 
 Useful flags:
@@ -110,6 +111,10 @@ Useful flags:
 - `--remove` / `--no-remove`: remove stopped containers instead of just stopping them
 - `--follow` / `--no-follow`: follow logs live or print and exit
 - `--tail <n>`: control how many log lines are shown
+- `--wait-seconds <n>`: optionally limit how long `start` or `addresses` waits for I2P destination files before reporting an error; by default they wait until each requested destination is published or a service failure is detected
+- `--json`: emit `start.py addresses` output as JSON for other tools to consume
+
+When `EXECUTION_PRIVACY_NETWORK=i2p` and you launch detached services, `python3 start.py start <target>` now waits for the execution nodes to publish their destinations and then prints them, or reports a container/runtime error if one fails first.
 
 ### `start.py` Start Targets
 
@@ -227,7 +232,9 @@ To run the execution stack through I2P:
 2. Leave `python3 start.py start all` as the launcher entrypoint. `all` now includes `i2p-router`.
 3. Keep `EXECUTION_I2P_BOOTSTRAP_FILE=/var/lib/crypto/execution/i2p/bootstrap-peers.txt` for the single-host Compose stack.
 4. The `execution-bootnode` container publishes its I2P destination into that shared file automatically.
-5. The other execution containers wait for that file and use the published destination through the SAM bridge on `i2p-router:7656`.
+5. Compose now runs a one-shot router configurator that enables and starts `SAMBridge` automatically through the I2P console on first launch.
+6. The other execution containers wait for that file and use the published destination through the SAM bridge on `i2p-router:7656`.
+7. Use `python3 start.py addresses all` to report the per-node I2P destinations after launch.
 
 Minimal privacy-mode `.env` example:
 
@@ -240,17 +247,44 @@ EXECUTION_I2P_SAM_PORT=7656
 EXECUTION_I2P_BOOTSTRAP_FILE=/var/lib/crypto/execution/i2p/bootstrap-peers.txt
 ```
 
+Example address lookup commands:
+
+```bash
+python3 start.py start all
+python3 start.py addresses all
+python3 start.py addresses bootnode --json
+```
+
+The JSON form is intended for other local tooling, including the graphical client:
+
+```json
+[
+  {
+    "address_file": "/abs/path/to/data/execution/demo-bootnode/i2p-destination.pub",
+    "i2p_destination": "example-destination.i2p",
+    "i2p_endpoint": "i2p://example-destination.i2p",
+    "node_name": "demo-bootnode",
+    "reason": null,
+    "service": "execution-bootnode",
+    "status": "available",
+    "target": "bootnode"
+  }
+]
+```
+
 What those settings do today:
 
 - `EXECUTION_CHAIN_ID` is now loaded by the execution demo containers as well as the RPC server, so the long-running roles and the JSON-RPC endpoint stay on the same configured chain ID
 - `EXECUTION_BOOTNODES` and `EXECUTION_STATIC_PEERS` are now loaded into the execution demo node config and surfaced in startup logs and bootnode discovery state
 - the default single-host bootstrap value is `execution-bootnode`, which is the Compose service name reachable from the other execution containers
 - `EXECUTION_PRIVACY_NETWORK=i2p` switches execution peer discovery and sync traffic onto an I2P SAM stream overlay backed by the `i2p-router` container
+- the Compose stack now auto-enables the router's `SAMBridge`, so the execution nodes do not depend on a manual console toggle
 - `EXECUTION_I2P_BOOTSTRAP_FILE` provides a shared destination file so the bootnode can publish its I2P endpoint for the rest of the execution stack
 
 Current limit:
 
 - the execution stack now has an I2P overlay for execution sync peer traffic, but the JSON-RPC API still binds normally on `EXECUTION_RPC_HOST:EXECUTION_RPC_PORT` unless you front it separately
+- `start.py addresses` reports the execution peer-overlay destinations, not an I2P-exposed JSON-RPC endpoint
 - the consensus simulator still uses an in-memory network and is not on I2P yet
 - this remains this repository's own chain and demo runtime, not Ethereum mainnet or a public testnet
 

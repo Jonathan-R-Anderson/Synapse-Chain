@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+COPY ensure_i2p_router_sam.py /app/ensure_i2p_router_sam.py
 COPY execution/src/crates /app/execution/src/crates
 
 RUN python -m pip install --upgrade pip setuptools wheel && \

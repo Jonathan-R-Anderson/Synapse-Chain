@@ -12,6 +12,16 @@ services:
       - "127.0.0.1:${I2P_CONSOLE_PORT}:7657"
     restart: unless-stopped
 
+  i2p-router-init:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
+    network_mode: "service:i2p-router"
+    command: ["python", "/app/ensure_i2p_router_sam.py", "--base-url", "http://127.0.0.1:7657", "--wait-seconds", "180"]
+    restart: "no"
+
   execution-rpc:
     build:
       context: .
@@ -37,7 +47,10 @@ services:
       context: .
       dockerfile: execution/Dockerfile
     depends_on:
-      - i2p-router
+      i2p-router:
+        condition: service_started
+      i2p-router-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -53,7 +66,10 @@ services:
       context: .
       dockerfile: execution/Dockerfile
     depends_on:
-      - i2p-router
+      i2p-router:
+        condition: service_started
+      i2p-router-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -69,7 +85,10 @@ services:
       context: .
       dockerfile: execution/Dockerfile
     depends_on:
-      - i2p-router
+      i2p-router:
+        condition: service_started
+      i2p-router-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -85,7 +104,10 @@ services:
       context: .
       dockerfile: execution/Dockerfile
     depends_on:
-      - i2p-router
+      i2p-router:
+        condition: service_started
+      i2p-router-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -102,7 +124,10 @@ services:
       context: .
       dockerfile: execution/Dockerfile
     depends_on:
-      - i2p-router
+      i2p-router:
+        condition: service_started
+      i2p-router-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -118,7 +143,10 @@ services:
       context: .
       dockerfile: execution/Dockerfile
     depends_on:
-      - i2p-router
+      i2p-router:
+        condition: service_started
+      i2p-router-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
