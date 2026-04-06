@@ -12,6 +12,7 @@ from .models import (
     SyncCheckpoint,
     SyncProgress,
 )
+from .networking import I2PNodePeerClient, I2POverlayConfig, I2POverlayServer, I2PSamSession, I2PTransportError
 from .networking.peer_manager import DHTDiscovery, DHTRoutingTable, PeerManager
 from .node_types import NodeType, SyncMode
 from .persistence import CheckpointStore, MetadataDB
@@ -32,6 +33,11 @@ __all__ = [
     "ChainStore",
     "DHTDiscovery",
     "DHTRoutingTable",
+    "I2PNodePeerClient",
+    "I2POverlayConfig",
+    "I2POverlayServer",
+    "I2PSamSession",
+    "I2PTransportError",
     "CheckpointStore",
     "MetadataDB",
     "MerkleProof",

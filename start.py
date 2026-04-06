@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 SERVICE_MAP = {
+    "i2p": "i2p-router",
     "rpc": "execution-rpc",
     "full": "execution-full",
     "light": "execution-light",
@@ -21,7 +22,7 @@ SERVICE_MAP = {
     "consensus": "consensus-sim",
 }
 
-LONG_RUNNING_TARGETS = ("rpc", "full", "light", "archive", "bootnode", "state-provider", "validator")
+LONG_RUNNING_TARGETS = ("i2p", "rpc", "full", "light", "archive", "bootnode", "state-provider", "validator")
 
 
 @dataclass(frozen=True, slots=True)

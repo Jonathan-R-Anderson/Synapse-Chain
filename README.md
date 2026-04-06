@@ -117,6 +117,7 @@ The `start` command accepts these targets:
 
 | Target | Docker service | What it runs | What it accomplishes |
 | --- | --- | --- | --- |
+| `i2p` | `i2p-router` | `geti2p/i2p` | Starts the I2P router and SAM bridge used by privacy-mode execution peers. The router console is exposed on `127.0.0.1:${I2P_CONSOLE_PORT}` by default. |
 | `rpc` | `execution-rpc` | `python -m rpc.server` | Starts the execution JSON-RPC API for local wallet/tool compatibility. This is the service that exposes port `8545` by default. |
 | `full` | `execution-full` | `container_node.py --mode full --keep-alive` | Runs a full-sync execution demo node with pruning enabled. It validates and stores recent chain state under the mounted execution data directory. |
 | `light` | `execution-light` | `container_node.py --mode light --keep-alive` | Runs a light-sync execution demo node. It tracks headers and proof-backed state fragments instead of maintaining full historical state. |
@@ -125,7 +126,7 @@ The `start` command accepts these targets:
 | `state-provider` | `execution-state-provider` | `container_node.py --mode state-provider --keep-alive` | Runs a full node that also serves state and blocks and can generate snapshots for other sync workflows. |
 | `validator` | `execution-validator` | `container_node.py --mode validator --keep-alive` | Runs a full-validation execution demo node configured for validator-style responsibilities. |
 | `consensus` | `consensus-sim` | `python -m consensus` | Runs the beacon-style consensus simulator for the configured validator count and epoch count, then exits. This target uses `docker compose --profile consensus run --rm --build consensus-sim` rather than a long-running `up` service. |
-| `all` | multiple services | `docker compose up --build -d ...` | Starts every long-running execution-side service together: `rpc`, `full`, `light`, `archive`, `bootnode`, `state-provider`, and `validator`. It does not include `consensus`. |
+| `all` | multiple services | `docker compose up --build -d ...` | Starts every long-running execution-side service together: `i2p`, `rpc`, `full`, `light`, `archive`, `bootnode`, `state-provider`, and `validator`. It does not include `consensus`. |
 
 `all` intentionally excludes `consensus` because the consensus simulator is modeled as a one-shot job, not a persistent service.
 
@@ -157,9 +158,10 @@ The current Compose setup is best thought of as one launcher driving several ind
            |   | Long-running execution    |       | One-shot consensus job    |
            |   | services                  |       | consensus-sim             |
            |   +---------------------------+       +---------------------------+
-           |   | execution-rpc             |       | runs for                  |
-           |   | execution-full            |       | CONSENSUS_EPOCHS, then    |
-           |   | execution-light           |       | exits                     |
+           |   | i2p-router                |       | runs for                  |
+           |   | execution-rpc             |       | CONSENSUS_EPOCHS, then    |
+           |   | execution-full            |       | exits                     |
+           |   | execution-light           |
            |   | execution-archive         |       +---------------------------+
            |   | execution-bootnode        |
            |   | execution-state-provider  |
@@ -175,17 +177,92 @@ The current Compose setup is best thought of as one launcher driving several ind
                python3 start.py logs all
 ```
 
-The execution node containers currently run self-contained demo roles from `execution/src/crates/execution/examples/container_node.py`. They are useful for exercising the runtime roles, but they are not yet wired together as one shared multi-container peer-to-peer network.
+The execution node containers currently run role-aware demo workloads from `execution/src/crates/execution/examples/container_node.py`. In plain mode they still fall back to in-process fixture peers. In privacy mode they can expose an I2P SAM-backed overlay for execution sync peer traffic. The separate consensus simulator remains an in-memory network and is not routed over I2P yet.
+
+### Long-Running Server Launch
+
+There are now two distinct launch styles in this repository:
+
+- embedded devnet: the Tk client can start a prefunded local dev chain for wallet and contract testing
+- long-running server stack: `start.py` plus Docker Compose starts the persistent execution services defined in `docker-compose.yml`
+
+The long-running stack is the non-dev launch path for this repository. It is persistent, uses the mounted execution data directory, and consumes bootstrap and chain settings from [`.env`](./.env). It is still this repository's own chain and demo runtime, not Ethereum mainnet or an official public testnet.
+
+To launch the long-running stack with explicit bootstrap settings:
+
+1. Edit [`.env`](./.env).
+2. Choose a chain ID for your network and leave `EXECUTION_DATA_DIR` pointed at durable storage.
+3. Set `EXECUTION_BOOTNODES` to a comma-separated list of bootstrap peers.
+4. Optionally set `EXECUTION_STATIC_PEERS` to a comma-separated list of peers you always want loaded into the node config.
+
+Single-host Compose example:
+
+```dotenv
+EXECUTION_CHAIN_ID=1337
+EXECUTION_BOOTNODES=execution-bootnode
+EXECUTION_STATIC_PEERS=
+```
+
+Remote-host example:
+
+```dotenv
+EXECUTION_CHAIN_ID=424242
+EXECUTION_BOOTNODES=bootnode-1.example.org:30303,bootnode-2.example.org:30303
+EXECUTION_STATIC_PEERS=full-1.example.org:30303,state-provider-1.example.org:30303
+```
+
+Then bring the stack up:
+
+```bash
+python3 start.py start bootnode
+python3 start.py start all
+python3 start.py ps
+python3 start.py logs bootnode
+python3 start.py logs all
+```
+
+To run the execution stack through I2P:
+
+1. Leave the checked-in default `EXECUTION_PRIVACY_NETWORK=i2p` in [`.env`](./.env), or set it explicitly if you changed it.
+2. Leave `python3 start.py start all` as the launcher entrypoint. `all` now includes `i2p-router`.
+3. Keep `EXECUTION_I2P_BOOTSTRAP_FILE=/var/lib/crypto/execution/i2p/bootstrap-peers.txt` for the single-host Compose stack.
+4. The `execution-bootnode` container publishes its I2P destination into that shared file automatically.
+5. The other execution containers wait for that file and use the published destination through the SAM bridge on `i2p-router:7656`.
+
+Minimal privacy-mode `.env` example:
+
+```dotenv
+EXECUTION_PRIVACY_NETWORK=i2p
+EXECUTION_BOOTNODES=
+EXECUTION_STATIC_PEERS=
+EXECUTION_I2P_SAM_HOST=i2p-router
+EXECUTION_I2P_SAM_PORT=7656
+EXECUTION_I2P_BOOTSTRAP_FILE=/var/lib/crypto/execution/i2p/bootstrap-peers.txt
+```
+
+What those settings do today:
+
+- `EXECUTION_CHAIN_ID` is now loaded by the execution demo containers as well as the RPC server, so the long-running roles and the JSON-RPC endpoint stay on the same configured chain ID
+- `EXECUTION_BOOTNODES` and `EXECUTION_STATIC_PEERS` are now loaded into the execution demo node config and surfaced in startup logs and bootnode discovery state
+- the default single-host bootstrap value is `execution-bootnode`, which is the Compose service name reachable from the other execution containers
+- `EXECUTION_PRIVACY_NETWORK=i2p` switches execution peer discovery and sync traffic onto an I2P SAM stream overlay backed by the `i2p-router` container
+- `EXECUTION_I2P_BOOTSTRAP_FILE` provides a shared destination file so the bootnode can publish its I2P endpoint for the rest of the execution stack
+
+Current limit:
+
+- the execution stack now has an I2P overlay for execution sync peer traffic, but the JSON-RPC API still binds normally on `EXECUTION_RPC_HOST:EXECUTION_RPC_PORT` unless you front it separately
+- the consensus simulator still uses an in-memory network and is not on I2P yet
+- this remains this repository's own chain and demo runtime, not Ethereum mainnet or a public testnet
 
 ### Direct Docker Commands
 
 If you prefer Docker Compose directly, the launcher maps to these common commands:
 
 ```bash
-docker compose up --build execution-rpc
-docker compose up --build -d execution-rpc execution-full execution-light execution-archive execution-bootnode execution-state-provider execution-validator
+docker compose up --build i2p-router execution-rpc
+docker compose up --build -d i2p-router execution-rpc execution-full execution-light execution-archive execution-bootnode execution-state-provider execution-validator
 docker compose --profile consensus run --rm --build consensus-sim
-docker compose logs --tail=100 -f execution-rpc execution-full execution-light execution-archive execution-bootnode execution-state-provider execution-validator
+docker compose logs --tail=100 -f i2p-router execution-rpc execution-full execution-light execution-archive execution-bootnode execution-state-provider execution-validator
 ```
 
 ### Environment Variables
@@ -196,13 +273,27 @@ The default Docker values live in [`.env`](./.env):
 - `EXECUTION_RPC_PORT`
 - `EXECUTION_CHAIN_ID`
 - `EXECUTION_MINING_MODE`
+- `EXECUTION_PRIVACY_NETWORK`
 - `EXECUTION_DATA_DIR`
 - `EXECUTION_STATE_ROOT`
 - `EXECUTION_NODE_STATUS_INTERVAL`
+- `EXECUTION_BOOTNODES`
+- `EXECUTION_STATIC_PEERS`
+- `EXECUTION_I2P_SAM_HOST`
+- `EXECUTION_I2P_SAM_PORT`
+- `EXECUTION_I2P_SIGNATURE_TYPE`
+- `EXECUTION_I2P_INBOUND_QUANTITY`
+- `EXECUTION_I2P_OUTBOUND_QUANTITY`
+- `EXECUTION_I2P_TIMEOUT_SECONDS`
+- `EXECUTION_I2P_BOOTSTRAP_FILE`
+- `EXECUTION_I2P_BOOTSTRAP_WAIT_SECONDS`
+- `EXECUTION_I2P_PUBLISH_DESTINATION`
+- `I2P_DATA_DIR`
+- `I2P_CONSOLE_PORT`
 - `CONSENSUS_VALIDATORS`
 - `CONSENSUS_EPOCHS`
 
-`EXECUTION_DATA_DIR` is mounted into the execution containers so there is a stable host path available for persisted sync and RPC artifacts. `EXECUTION_STATE_ROOT` is the in-container base path used by the execution demo modes when they create per-role state directories such as `demo-full` or `demo-validator`.
+`EXECUTION_DATA_DIR` is mounted into the execution containers so there is a stable host path available for persisted sync and RPC artifacts. `EXECUTION_STATE_ROOT` is the in-container base path used by the execution demo modes when they create per-role state directories such as `demo-full` or `demo-validator`. `EXECUTION_BOOTNODES` and `EXECUTION_STATIC_PEERS` are comma-separated peer references consumed by the long-running execution demo roles. `EXECUTION_CHAIN_ID` now applies to both `execution-rpc` and the example execution containers. `EXECUTION_PRIVACY_NETWORK=i2p` enables the I2P SAM overlay for execution sync peers, and `EXECUTION_I2P_BOOTSTRAP_FILE` is the shared destination file used by the bootnode publisher and the other execution services.
 
 ### Tests
 
@@ -249,6 +340,9 @@ What the desktop client includes:
 - embedded devnet launcher with prefunded accounts for local testing
 - wallet import by private key with address derivation
 - native transfer builder and signed transaction submission
+- Solidity contract compile/deploy workflow using `solc` plus the execution deployment toolkit
+- consensus simulation and reward-block mining lab using the execution `dev_mine` extension
+- network map tab that inspects the configured stack and, when Docker access is available, current container IP addresses
 - block, transaction, receipt, and trace explorer
 - `eth_call`, `eth_estimateGas`, and `debug_traceCall` tools
 - raw JSON-RPC console for arbitrary method calls
@@ -256,6 +350,8 @@ What the desktop client includes:
 Current client scope:
 
 - it supports native-coin transfers on this chain
+- it can deploy compiled Solidity contracts, but Solidity compilation still depends on an external `solc` install
+- it can mint developer reward blocks from the GUI, but those rewards come from a dev RPC extension and are not canonical Ethereum consensus behavior
 - it does not implement an exchange, order book, AMM, or token trading backend because those contracts and APIs do not exist in the current node
 
 ### Smart Contract Deployment
@@ -675,6 +771,22 @@ Important write-path notes:
 - `eth_accounts` is empty by default
 - A raw transaction must be signed before submission
 - The sender must already have enough balance for gas and value
+
+##### Developer Extensions
+
+| Method | Params | Returns | Notes |
+| --- | --- | --- | --- |
+| `dev_getConfig` | `[]` | object | Returns dev-side compatibility settings such as coinbase and mining mode |
+| `dev_setCoinbase` | `[address]` | address | Updates the beneficiary used for later dev mining |
+| `dev_mine` | `[options?]` | block summary array | Mines one or more blocks, can mine empty blocks, and can mint a configured developer reward to the beneficiary |
+
+Example:
+
+```bash
+rpc dev_getConfig
+rpc dev_setCoinbase '["0x1111111111111111111111111111111111111111"]'
+rpc dev_mine '[{"count":"0x1","reward":"0x3e8","beneficiary":"0x1111111111111111111111111111111111111111","allowEmpty":true,"algorithm":"manual"}]'
+```
 
 #### Mining / Block Production Behavior
 

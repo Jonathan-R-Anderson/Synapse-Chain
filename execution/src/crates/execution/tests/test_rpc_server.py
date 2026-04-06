@@ -184,6 +184,35 @@ class RpcServerTests(unittest.TestCase):
         confirmed_balance = self._rpc(server, "eth_getBalance", [recipient.to_hex(), "latest"], request_id=7)
         self.assertEqual(confirmed_balance["result"], "0x5")
 
+    def test_dev_mine_supports_empty_reward_blocks_and_coinbase_override(self) -> None:
+        server = self._funded_server(mode="mempool")
+        miner = addr("0x4000000000000000000000000000000000000004")
+
+        config_response = self._rpc(server, "dev_getConfig", [], request_id=8)
+        self.assertEqual(config_response["result"]["miningMode"], "mempool")
+
+        set_coinbase = self._rpc(server, "dev_setCoinbase", [miner.to_hex()], request_id=9)
+        self.assertEqual(set_coinbase["result"], miner.to_hex())
+
+        mine_response = self._rpc(
+            server,
+            "dev_mine",
+            [{"count": "0x1", "reward": "0xa", "beneficiary": miner.to_hex(), "allowEmpty": True, "algorithm": "hybrid-beacon"}],
+            request_id=10,
+        )
+        mined = mine_response["result"]
+        self.assertEqual(len(mined), 1)
+        self.assertEqual(mined[0]["miner"], miner.to_hex())
+        self.assertEqual(mined[0]["reward"], "0xa")
+        self.assertEqual(mined[0]["algorithm"], "hybrid-beacon")
+
+        balance_response = self._rpc(server, "eth_getBalance", [miner.to_hex(), "latest"], request_id=11)
+        self.assertEqual(balance_response["result"], "0xa")
+
+        block_response = self._rpc(server, "eth_getBlockByNumber", ["latest", False], request_id=12)
+        self.assertEqual(block_response["result"]["number"], "0x1")
+        self.assertEqual(block_response["result"]["miner"], miner.to_hex())
+
 
 if __name__ == "__main__":
     unittest.main()

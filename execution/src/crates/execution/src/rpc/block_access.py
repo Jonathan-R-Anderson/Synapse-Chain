@@ -125,17 +125,27 @@ class ExecutionNode:
         return self.txpool.get_by_hash(key)
 
     def _pending_block_env(self) -> BlockEnvironment:
+        return self._pending_block_env_for()
+
+    def _pending_block_env_for(
+        self,
+        *,
+        beneficiary: Address | None = None,
+        extra_data: bytes | None = None,
+    ) -> BlockEnvironment:
         parent = self.head.block.header
         next_number = parent.number + 1
         next_timestamp = self.compat_config.next_timestamp(parent.timestamp)
+        resolved_beneficiary = self.compat_config.default_coinbase if beneficiary is None else beneficiary
+        resolved_extra_data = self.compat_config.extra_data if extra_data is None else bytes(extra_data)
         next_block = self.block_builder.build_block(
             parent_block=self.head.block,
             transactions=(),
             execution_result=ExecutionPayload(receipts=(), gas_used=0, state=self.head.post_state.clone()),
             timestamp=next_timestamp,
             gas_limit=parent.gas_limit,
-            beneficiary=self.compat_config.default_coinbase,
-            extra_data=self.compat_config.extra_data,
+            beneficiary=resolved_beneficiary,
+            extra_data=resolved_extra_data,
         )
         return BlockEnvironment.from_block(next_block, self.chain_config)
 
@@ -144,8 +154,16 @@ class ExecutionNode:
         *,
         max_transactions: int | None = None,
         exclude: Callable[[PendingTransaction], bool] | None = None,
+        beneficiary: Address | None = None,
+        block_reward: int = 0,
+        extra_data: bytes | None = None,
     ) -> PendingPreview:
-        pending_env = self._pending_block_env()
+        if block_reward < 0:
+            raise ValueError("block_reward must be non-negative")
+        resolved_extra_data = self.compat_config.extra_data if extra_data is None else bytes(extra_data)
+        if len(resolved_extra_data) > 32:
+            raise ValueError("extra_data must be at most 32 bytes")
+        pending_env = self._pending_block_env_for(beneficiary=beneficiary, extra_data=resolved_extra_data)
         working_state = self.head.post_state.clone()
         interpreter = Interpreter(state=working_state)
         included: list[PendingTransaction] = []
@@ -175,6 +193,9 @@ class ExecutionNode:
             results.append(result)
             cumulative_gas += result.gas_used
 
+        if block_reward:
+            working_state.add_balance(pending_env.coinbase, block_reward)
+
         payload = ExecutionPayload(
             receipts=tuple(result.receipt for result in results if result.receipt is not None),
             gas_used=cumulative_gas,
@@ -188,7 +209,7 @@ class ExecutionNode:
             timestamp=pending_env.timestamp,
             gas_limit=pending_env.gas_limit,
             beneficiary=pending_env.coinbase,
-            extra_data=self.compat_config.extra_data,
+            extra_data=resolved_extra_data,
         )
         return PendingPreview(
             block=block,
@@ -201,8 +222,24 @@ class ExecutionNode:
         )
 
     def append_pending_block(self, *, max_transactions: int | None = None) -> BlockRecord | None:
-        preview = self.build_pending_preview(max_transactions=max_transactions)
-        if not preview.pending_transactions:
+        return self.mine_block(max_transactions=max_transactions)
+
+    def mine_block(
+        self,
+        *,
+        max_transactions: int | None = None,
+        beneficiary: Address | None = None,
+        block_reward: int = 0,
+        allow_empty: bool = False,
+        extra_data: bytes | None = None,
+    ) -> BlockRecord | None:
+        preview = self.build_pending_preview(
+            max_transactions=max_transactions,
+            beneficiary=beneficiary,
+            block_reward=block_reward,
+            extra_data=extra_data,
+        )
+        if not preview.pending_transactions and not allow_empty and block_reward == 0:
             return None
         log_index_start = 0
         tx_records: list[TransactionRecord] = []

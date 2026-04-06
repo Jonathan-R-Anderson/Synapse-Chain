@@ -2,15 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
+import io
 import json
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -19,14 +27,20 @@ import tkinter as tk
 
 ROOT = Path(__file__).resolve().parent
 CRATES = ROOT / "execution" / "src" / "crates"
+CONSENSUS_SRC = ROOT / "consensus" / "src"
 
 for crate_name in ("execution", "evm", "transactions", "zk", "state", "encoding", "crypto", "primitives"):
     source_path = CRATES / crate_name / "src"
     if str(source_path) not in sys.path:
         sys.path.insert(0, str(source_path))
+if str(CONSENSUS_SRC) not in sys.path:
+    sys.path.insert(0, str(CONSENSUS_SRC))
 
 from crypto import SECP256K1_N, address_from_private_key  # noqa: E402
+from consensus.networking.simulation import run_network_simulation  # noqa: E402
+from consensus.simulation import run_simulation as run_beacon_simulation  # noqa: E402
 from evm import StateDB  # noqa: E402
+from execution.contracts import ContractDeployer, load_contract_abi, load_contract_artifact  # noqa: E402
 from execution import ChainConfig, EIP1559Transaction, LegacyTransaction  # noqa: E402
 from primitives import Address  # noqa: E402
 from rpc.block_access import ExecutionNode  # noqa: E402
@@ -36,6 +50,67 @@ from rpc.server import JsonRpcServer  # noqa: E402
 
 APP_TITLE = "Python Ethereum Desktop Client"
 DEV_ACCOUNT_BALANCE = 10**24
+CONSENSUS_ALGORITHMS = (
+    ("manual", "Manual Reward Block"),
+    ("hybrid-beacon", "Hybrid Beacon Simulation"),
+    ("pbft-committee", "PBFT Committee Simulation"),
+)
+STACK_SERVICE_BLUEPRINTS = (
+    {
+        "service": "i2p-router",
+        "role": "I2P Router",
+        "description": "SAM bridge and router used by privacy-mode execution nodes.",
+        "host_endpoint": lambda env: f"http://127.0.0.1:{env.get('I2P_CONSOLE_PORT', '7657')}",
+    },
+    {
+        "service": "execution-rpc",
+        "role": "Execution RPC",
+        "description": "Ethereum-style JSON-RPC endpoint exposed to host clients.",
+        "host_endpoint": lambda env: f"http://127.0.0.1:{env.get('EXECUTION_RPC_PORT', '8545')}",
+    },
+    {
+        "service": "execution-full",
+        "role": "Execution Full",
+        "description": "Full-sync execution demo node.",
+        "host_endpoint": lambda env: None,
+    },
+    {
+        "service": "execution-light",
+        "role": "Execution Light",
+        "description": "Light-sync execution demo node.",
+        "host_endpoint": lambda env: None,
+    },
+    {
+        "service": "execution-archive",
+        "role": "Execution Archive",
+        "description": "Archive execution demo node.",
+        "host_endpoint": lambda env: None,
+    },
+    {
+        "service": "execution-bootnode",
+        "role": "Execution Bootnode",
+        "description": "Peer-discovery oriented execution bootnode.",
+        "host_endpoint": lambda env: None,
+    },
+    {
+        "service": "execution-state-provider",
+        "role": "Execution State Provider",
+        "description": "Execution node serving state and snapshot data.",
+        "host_endpoint": lambda env: None,
+    },
+    {
+        "service": "execution-validator",
+        "role": "Execution Validator",
+        "description": "Execution validator-role demo node.",
+        "host_endpoint": lambda env: None,
+    },
+    {
+        "service": "consensus-sim",
+        "role": "Consensus Simulation",
+        "description": "One-shot hybrid consensus simulator profile.",
+        "host_endpoint": lambda env: None,
+    },
+)
 PALETTE = {
     "bg": "#f2efe7",
     "panel": "#fffaf2",
@@ -74,6 +149,230 @@ class WalletProfile:
     @property
     def combo_label(self) -> str:
         return f"{self.label} | {self.address}"
+
+
+@dataclass(frozen=True, slots=True)
+class StackServiceStatus:
+    service: str
+    role: str
+    description: str
+    status: str
+    host_endpoint: str | None = None
+    container_name: str | None = None
+    container_ips: tuple[str, ...] = ()
+    networks: tuple[str, ...] = ()
+    note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StackSnapshot:
+    project_name: str
+    host_ips: tuple[str, ...]
+    services: tuple[StackServiceStatus, ...]
+    discovery_error: str | None = None
+
+
+def parse_json_array(value: str, *, label: str) -> list[object]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} must be valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, list):
+        raise ValueError(f"{label} must decode to a JSON array")
+    return payload
+
+
+def read_env_settings(path: Path) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    if not path.exists():
+        return payload
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        payload[key.strip()] = value.strip()
+    return payload
+
+
+def host_ip_addresses() -> tuple[str, ...]:
+    addresses = {"127.0.0.1"}
+    try:
+        for result in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM):
+            addresses.add(str(result[4][0]))
+    except OSError:
+        pass
+    return tuple(sorted(addresses))
+
+
+def _parse_compose_ps_output(raw: str) -> list[dict[str, object]]:
+    text = raw.strip()
+    if not text:
+        return []
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        items: list[dict[str, object]] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                items.append(parsed)
+        return items
+    if isinstance(decoded, list):
+        return [item for item in decoded if isinstance(item, dict)]
+    if isinstance(decoded, dict):
+        return [decoded]
+    return []
+
+
+def inspect_container_networks(container_name: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    completed = subprocess.run(
+        ["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", container_name],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout.strip() or "{}")
+    if not isinstance(payload, dict):
+        return (), ()
+    ips: list[str] = []
+    network_names: list[str] = []
+    for network_name, data in payload.items():
+        network_names.append(str(network_name))
+        if isinstance(data, dict):
+            ip_address = str(data.get("IPAddress", "")).strip()
+            if ip_address:
+                ips.append(ip_address)
+    return tuple(ips), tuple(network_names)
+
+
+def inspect_stack_snapshot(*, dev_server: "EmbeddedRpcServer | None" = None) -> StackSnapshot:
+    env = read_env_settings(ROOT / ".env")
+    running_by_service: dict[str, dict[str, object]] = {}
+    discovery_error: str | None = None
+
+    try:
+        completed = subprocess.run(
+            ["docker", "compose", "ps", "--format", "json"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for entry in _parse_compose_ps_output(completed.stdout):
+            service_name = str(entry.get("Service") or entry.get("Name") or "").strip()
+            if service_name:
+                running_by_service[service_name] = entry
+    except Exception as exc:  # noqa: BLE001
+        discovery_error = str(exc)
+
+    services: list[StackServiceStatus] = []
+    for blueprint in STACK_SERVICE_BLUEPRINTS:
+        service_name = str(blueprint["service"])
+        runtime_entry = running_by_service.get(service_name)
+        host_endpoint = blueprint["host_endpoint"](env)
+        status = "configured"
+        container_name = None
+        container_ips: tuple[str, ...] = ()
+        networks: tuple[str, ...] = ()
+        note = ""
+        if runtime_entry is not None:
+            status = str(runtime_entry.get("State") or runtime_entry.get("Status") or "running")
+            container_name = str(runtime_entry.get("Name") or "")
+            if container_name:
+                try:
+                    container_ips, networks = inspect_container_networks(container_name)
+                except Exception as exc:  # noqa: BLE001
+                    note = str(exc)
+        services.append(
+            StackServiceStatus(
+                service=service_name,
+                role=str(blueprint["role"]),
+                description=str(blueprint["description"]),
+                status=status,
+                host_endpoint=host_endpoint,
+                container_name=container_name,
+                container_ips=container_ips,
+                networks=networks,
+                note=note,
+            )
+        )
+
+    if dev_server is not None and dev_server.running:
+        services.append(
+            StackServiceStatus(
+                service="embedded-devnet",
+                role="Embedded RPC",
+                description="Tkinter client embedded prefunded execution devnet.",
+                status="running",
+                host_endpoint=dev_server.rpc_url,
+                container_name=None,
+                container_ips=(dev_server.host,),
+                networks=(),
+                note=f"chainId={dev_server.chain_id} mode={dev_server.mining_mode}",
+            )
+        )
+
+    return StackSnapshot(
+        project_name=env.get("COMPOSE_PROJECT_NAME", "python-ethereum-client"),
+        host_ips=host_ip_addresses(),
+        services=tuple(services),
+        discovery_error=discovery_error,
+    )
+
+
+def compile_solidity_source(source_path: str, *, contract_name: str | None = None) -> dict[str, str]:
+    solc_path = shutil.which("solc")
+    if solc_path is None:
+        raise RuntimeError("solc is not installed or not on PATH")
+
+    source = Path(source_path).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+    if source.suffix.lower() != ".sol":
+        raise ValueError("source path must point to a .sol Solidity file")
+
+    output_dir = Path(tempfile.mkdtemp(prefix="solc-artifacts-"))
+    completed = subprocess.run(
+        [solc_path, "--bin", "--abi", "-o", str(output_dir), str(source)],
+        cwd=source.parent,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "solc failed"
+        raise RuntimeError(detail)
+
+    if contract_name is not None:
+        artifact_path = output_dir / f"{contract_name}.bin"
+        abi_path = output_dir / f"{contract_name}.abi"
+        if not artifact_path.exists() or not abi_path.exists():
+            available = ", ".join(path.stem for path in sorted(output_dir.glob("*.bin")))
+            raise RuntimeError(f"contract {contract_name!r} was not produced by solc. Available artifacts: {available or 'none'}")
+    else:
+        artifacts = sorted(output_dir.glob("*.bin"))
+        if not artifacts:
+            raise RuntimeError("solc completed but did not emit any .bin artifacts")
+        if len(artifacts) > 1:
+            names = ", ".join(path.stem for path in artifacts)
+            raise RuntimeError(f"multiple contracts were produced; set Contract Name first ({names})")
+        artifact_path = artifacts[0]
+        abi_path = artifact_path.with_suffix(".abi")
+
+    return {
+        "sourcePath": str(source),
+        "outputDir": str(output_dir),
+        "artifactPath": str(artifact_path),
+        "abiPath": str(abi_path),
+        "contractName": artifact_path.stem,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+    }
 
 
 class RpcHttpClient:
@@ -158,6 +457,8 @@ class EmbeddedRpcServer:
         self.mining_mode = mining_mode
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self.node: ExecutionNode | None = None
+        self.rpc_server: JsonRpcServer | None = None
         self.wallets: list[WalletProfile] = []
 
     @property
@@ -197,6 +498,8 @@ class EmbeddedRpcServer:
             state=state,
         )
         rpc_server = JsonRpcServer(node)
+        self.node = node
+        self.rpc_server = rpc_server
 
         started = threading.Event()
         errors: list[BaseException] = []
@@ -268,6 +571,46 @@ class EmbeddedRpcServer:
             thread.join(timeout=3)
         self._httpd = None
         self._thread = None
+        self.node = None
+        self.rpc_server = None
+
+    def mine_blocks(
+        self,
+        *,
+        beneficiary: str,
+        reward: int,
+        count: int,
+        algorithm: str,
+    ) -> list[dict[str, object]]:
+        if not self.running or self.node is None:
+            raise RuntimeError("embedded devnet is not running")
+        miner = Address.from_hex(beneficiary)
+        results: list[dict[str, object]] = []
+        extra_data = f"mine:{algorithm}".encode("ascii")[:32]
+        for _ in range(count):
+            record = self.node.mine_block(
+                beneficiary=miner,
+                block_reward=max(0, int(reward)),
+                allow_empty=True,
+                extra_data=extra_data,
+            )
+            if record is None:
+                break
+            results.append(
+                {
+                    "number": hex(record.block.header.number),
+                    "hash": record.block.hash().to_hex(),
+                    "miner": record.block.header.coinbase.to_hex(),
+                    "reward": hex(max(0, int(reward))),
+                    "algorithm": algorithm,
+                    "transactionCount": hex(len(record.transaction_records)),
+                    "gasUsed": hex(record.block.header.gas_used),
+                    "baseFeePerGas": hex(record.block.header.base_fee or 0),
+                    "extraData": "0x" + record.block.header.extra_data.hex(),
+                    "totalDifficulty": hex(record.total_difficulty),
+                }
+            )
+        return results
 
 
 def parse_int_value(value: str, *, label: str) -> int:
@@ -362,6 +705,32 @@ class BlockchainDesktopClient(tk.Tk):
         self.transfer_priority_fee_var = tk.StringVar()
         self.transfer_max_fee_var = tk.StringVar()
 
+        self.contract_source_var = tk.StringVar()
+        self.contract_artifact_var = tk.StringVar()
+        self.contract_abi_var = tk.StringVar()
+        self.contract_name_var = tk.StringVar()
+        self.contract_sender_var = tk.StringVar()
+        self.contract_constructor_args_var = tk.StringVar(value="[]")
+        self.contract_tx_type_var = tk.StringVar(value="EIP-1559")
+        self.contract_chain_id_var = tk.StringVar(value=str(embedded_chain_id))
+        self.contract_gas_limit_var = tk.StringVar(value="800000")
+        self.contract_value_var = tk.StringVar(value="0")
+        self.contract_gas_price_var = tk.StringVar()
+        self.contract_priority_fee_var = tk.StringVar()
+        self.contract_max_fee_var = tk.StringVar()
+
+        self.mining_algorithm_var = tk.StringVar(value="manual")
+        self.mining_wallet_var = tk.StringVar()
+        self.mining_reward_var = tk.StringVar(value="1000")
+        self.mining_count_var = tk.StringVar(value="1")
+        self.mining_allow_empty_var = tk.BooleanVar(value=True)
+        self.mining_validators_var = tk.StringVar(value="24")
+        self.mining_epochs_var = tk.StringVar(value="2")
+        self.mining_nodes_var = tk.StringVar(value="10")
+        self.mining_rounds_var = tk.StringVar(value="3")
+        self.mining_byzantine_var = tk.StringVar(value="1")
+        self.mining_degree_var = tk.StringVar(value="3")
+
         self.block_selector_var = tk.StringVar(value="latest")
         self.tx_hash_var = tk.StringVar()
 
@@ -391,6 +760,7 @@ class BlockchainDesktopClient(tk.Tk):
 
         self._build_style()
         self._build_layout()
+        self.after(350, self.refresh_network_map)
 
         if start_devnet:
             self.after(200, self.start_devnet)
@@ -426,7 +796,7 @@ class BlockchainDesktopClient(tk.Tk):
         ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Desktop wallet, explorer, call/tracing console, and native transfer client for the Python Ethereum-like chain.",
+            text="Desktop wallet, contract deployer, consensus mining lab, explorer, and network map for the Python Ethereum-like stack.",
             style="Subheader.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -436,23 +806,32 @@ class BlockchainDesktopClient(tk.Tk):
         self.connection_tab = ttk.Frame(notebook, padding=10)
         self.wallet_tab = ttk.Frame(notebook, padding=10)
         self.transfer_tab = ttk.Frame(notebook, padding=10)
+        self.contracts_tab = ttk.Frame(notebook, padding=10)
+        self.mining_tab = ttk.Frame(notebook, padding=10)
         self.explorer_tab = ttk.Frame(notebook, padding=10)
         self.call_tab = ttk.Frame(notebook, padding=10)
         self.console_tab = ttk.Frame(notebook, padding=10)
+        self.network_tab = ttk.Frame(notebook, padding=10)
 
         notebook.add(self.connection_tab, text="Connection")
         notebook.add(self.wallet_tab, text="Wallets")
         notebook.add(self.transfer_tab, text="Transfer / Trade")
+        notebook.add(self.contracts_tab, text="Contracts")
+        notebook.add(self.mining_tab, text="Consensus / Mining")
         notebook.add(self.explorer_tab, text="Explorer")
         notebook.add(self.call_tab, text="Call / Trace")
         notebook.add(self.console_tab, text="RPC Console")
+        notebook.add(self.network_tab, text="Network Map")
 
         self._build_connection_tab()
         self._build_wallet_tab()
         self._build_transfer_tab()
+        self._build_contracts_tab()
+        self._build_mining_tab()
         self._build_explorer_tab()
         self._build_call_tab()
         self._build_console_tab()
+        self._build_network_tab()
 
         status_bar = ttk.Frame(outer, style="Card.TFrame", padding=(12, 8))
         status_bar.pack(fill="x", pady=(14, 0))
@@ -645,6 +1024,203 @@ class BlockchainDesktopClient(tk.Tk):
             "Choose a sender wallet, set recipient and amount, then preview or send a signed native transfer.",
         )
         self.transfer_output_text.configure(state="disabled")
+
+    def _build_contracts_tab(self) -> None:
+        source_frame = ttk.LabelFrame(self.contracts_tab, text="Solidity / Artifact Inputs", padding=14)
+        source_frame.pack(fill="x")
+
+        ttk.Label(source_frame, text="Solidity Source").grid(row=0, column=0, sticky="w")
+        ttk.Entry(source_frame, textvariable=self.contract_source_var, width=72).grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(source_frame, text="Browse", command=self.browse_contract_source).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(source_frame, text="Compile With solc", style="Primary.TButton", command=self.compile_contract_source).grid(row=0, column=3)
+
+        ttk.Label(source_frame, text="Artifact (.bin/.json)").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(source_frame, textvariable=self.contract_artifact_var, width=72).grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(10, 0))
+        ttk.Button(source_frame, text="Browse", command=self.browse_contract_artifact).grid(row=1, column=2, padx=(0, 8), pady=(10, 0))
+        ttk.Label(source_frame, text="ABI (.abi/.json)").grid(row=1, column=3, sticky="w", pady=(10, 0))
+        ttk.Entry(source_frame, textvariable=self.contract_abi_var, width=44).grid(row=1, column=4, sticky="ew", padx=(8, 0), pady=(10, 0))
+        ttk.Button(source_frame, text="Browse", command=self.browse_contract_abi).grid(row=1, column=5, padx=(8, 0), pady=(10, 0))
+
+        ttk.Label(source_frame, text="Contract Name").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(source_frame, textvariable=self.contract_name_var, width=24).grid(row=2, column=1, sticky="w", padx=(8, 8), pady=(10, 0))
+        ttk.Label(
+            source_frame,
+            text="Use Contract Name when a JSON artifact or Solidity source emits multiple contracts.",
+            background=PALETTE["panel"],
+            foreground=PALETTE["muted"],
+        ).grid(row=2, column=3, columnspan=3, sticky="w", pady=(10, 0))
+
+        source_frame.columnconfigure(1, weight=1)
+        source_frame.columnconfigure(4, weight=1)
+
+        deploy_frame = ttk.LabelFrame(self.contracts_tab, text="Deploy Contract", padding=14)
+        deploy_frame.pack(fill="x", pady=(14, 0))
+
+        ttk.Label(deploy_frame, text="Signer").grid(row=0, column=0, sticky="w")
+        self.contract_sender_combo = ttk.Combobox(deploy_frame, textvariable=self.contract_sender_var, values=(), width=54)
+        self.contract_sender_combo.grid(row=0, column=1, sticky="ew", padx=(8, 14))
+        ttk.Label(deploy_frame, text="Tx Type").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(deploy_frame, textvariable=self.contract_tx_type_var, values=("EIP-1559", "Legacy"), state="readonly", width=18).grid(
+            row=0, column=3, sticky="ew", padx=(8, 14)
+        )
+        ttk.Button(deploy_frame, text="Load Fee Defaults", command=self.load_contract_defaults).grid(row=0, column=4)
+
+        ttk.Label(deploy_frame, text="Constructor Args JSON").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(deploy_frame, textvariable=self.contract_constructor_args_var, width=54).grid(
+            row=1, column=1, sticky="ew", padx=(8, 14), pady=(10, 0)
+        )
+        ttk.Label(deploy_frame, text="Chain ID").grid(row=1, column=2, sticky="w", pady=(10, 0))
+        ttk.Entry(deploy_frame, textvariable=self.contract_chain_id_var, width=18).grid(row=1, column=3, sticky="ew", padx=(8, 14), pady=(10, 0))
+        ttk.Label(deploy_frame, text="Value").grid(row=1, column=4, sticky="w", pady=(10, 0))
+        ttk.Entry(deploy_frame, textvariable=self.contract_value_var, width=18).grid(row=1, column=5, sticky="ew", padx=(8, 0), pady=(10, 0))
+
+        ttk.Label(deploy_frame, text="Gas Limit").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(deploy_frame, textvariable=self.contract_gas_limit_var, width=18).grid(row=2, column=1, sticky="ew", padx=(8, 14), pady=(10, 0))
+        ttk.Label(deploy_frame, text="Gas Price").grid(row=2, column=2, sticky="w", pady=(10, 0))
+        ttk.Entry(deploy_frame, textvariable=self.contract_gas_price_var, width=18).grid(row=2, column=3, sticky="ew", padx=(8, 14), pady=(10, 0))
+        ttk.Label(deploy_frame, text="Max Priority Fee").grid(row=2, column=4, sticky="w", pady=(10, 0))
+        ttk.Entry(deploy_frame, textvariable=self.contract_priority_fee_var, width=18).grid(row=2, column=5, sticky="ew", padx=(8, 0), pady=(10, 0))
+
+        ttk.Label(deploy_frame, text="Max Fee").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(deploy_frame, textvariable=self.contract_max_fee_var, width=18).grid(row=3, column=1, sticky="ew", padx=(8, 14), pady=(10, 0))
+
+        contract_buttons = ttk.Frame(deploy_frame)
+        contract_buttons.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(16, 0))
+        ttk.Button(contract_buttons, text="Preview Deployment", style="Primary.TButton", command=self.preview_contract_deploy).pack(side="left")
+        ttk.Button(contract_buttons, text="Deploy Contract", style="Accent.TButton", command=self.deploy_contract).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            contract_buttons,
+            text="Solidity compilation requires a local solc install. Deployment itself uses the execution JSON-RPC API.",
+            background=PALETTE["panel"],
+            foreground=PALETTE["muted"],
+        ).pack(side="left", padx=(14, 0))
+
+        for column in range(6):
+            deploy_frame.columnconfigure(column, weight=1)
+
+        output_frame = ttk.LabelFrame(self.contracts_tab, text="Contract Output", padding=14)
+        output_frame.pack(fill="both", expand=True, pady=(14, 0))
+        self.contract_output_text = ScrolledText(output_frame, wrap="none", font=("TkFixedFont", 9))
+        self.contract_output_text.pack(fill="both", expand=True)
+        self.contract_output_text.insert(
+            "1.0",
+            "Compile a Solidity file with solc or point at a compiled artifact, then preview or deploy the contract.",
+        )
+        self.contract_output_text.configure(state="disabled")
+
+    def _build_mining_tab(self) -> None:
+        top = ttk.LabelFrame(self.mining_tab, text="Consensus Mining Lab", padding=14)
+        top.pack(fill="x")
+
+        ttk.Label(top, text="Algorithm").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            top,
+            textvariable=self.mining_algorithm_var,
+            values=[name for name, _ in CONSENSUS_ALGORITHMS],
+            state="readonly",
+            width=24,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 14))
+        ttk.Label(top, text="Miner Wallet / Address").grid(row=0, column=2, sticky="w")
+        self.mining_wallet_combo = ttk.Combobox(top, textvariable=self.mining_wallet_var, values=(), width=54)
+        self.mining_wallet_combo.grid(row=0, column=3, sticky="ew", padx=(8, 14))
+        ttk.Label(top, text="Reward").grid(row=0, column=4, sticky="w")
+        ttk.Entry(top, textvariable=self.mining_reward_var, width=18).grid(row=0, column=5, sticky="ew", padx=(8, 0))
+
+        ttk.Label(top, text="Block Count").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(top, textvariable=self.mining_count_var, width=18).grid(row=1, column=1, sticky="ew", padx=(8, 14), pady=(10, 0))
+        ttk.Checkbutton(top, text="Allow Empty Blocks", variable=self.mining_allow_empty_var).grid(row=1, column=2, sticky="w", pady=(10, 0))
+        ttk.Label(
+            top,
+            text="Hybrid Beacon",
+            background=PALETTE["panel"],
+            foreground=PALETTE["accent"],
+        ).grid(row=1, column=3, sticky="w", pady=(10, 0))
+        ttk.Entry(top, textvariable=self.mining_validators_var, width=10).grid(row=1, column=4, sticky="ew", padx=(8, 4), pady=(10, 0))
+        ttk.Entry(top, textvariable=self.mining_epochs_var, width=10).grid(row=1, column=5, sticky="ew", padx=(4, 0), pady=(10, 0))
+
+        ttk.Label(top, text="PBFT Nodes").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(top, textvariable=self.mining_nodes_var, width=18).grid(row=2, column=1, sticky="ew", padx=(8, 14), pady=(10, 0))
+        ttk.Label(top, text="Rounds").grid(row=2, column=2, sticky="w", pady=(10, 0))
+        ttk.Entry(top, textvariable=self.mining_rounds_var, width=18).grid(row=2, column=3, sticky="ew", padx=(8, 14), pady=(10, 0))
+        ttk.Label(top, text="Byzantine").grid(row=2, column=4, sticky="w", pady=(10, 0))
+        ttk.Entry(top, textvariable=self.mining_byzantine_var, width=18).grid(row=2, column=5, sticky="ew", padx=(8, 0), pady=(10, 0))
+
+        ttk.Label(top, text="PBFT Degree").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(top, textvariable=self.mining_degree_var, width=18).grid(row=3, column=1, sticky="ew", padx=(8, 14), pady=(10, 0))
+
+        mining_buttons = ttk.Frame(top)
+        mining_buttons.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(16, 0))
+        ttk.Button(mining_buttons, text="Run Consensus Only", command=self.run_consensus_only).pack(side="left")
+        ttk.Button(mining_buttons, text="Mine Reward Block", style="Accent.TButton", command=self.mine_reward_block).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            mining_buttons,
+            text="Consensus simulations are local research workloads. Reward blocks use the execution dev_mine extension and are not canonical chain consensus.",
+            background=PALETTE["panel"],
+            foreground=PALETTE["muted"],
+        ).pack(side="left", padx=(14, 0))
+
+        for column in range(6):
+            top.columnconfigure(column, weight=1)
+
+        output_frame = ttk.LabelFrame(self.mining_tab, text="Consensus / Mining Output", padding=14)
+        output_frame.pack(fill="both", expand=True, pady=(14, 0))
+        self.mining_output_text = ScrolledText(output_frame, wrap="none", font=("TkFixedFont", 9))
+        self.mining_output_text.pack(fill="both", expand=True)
+        self.mining_output_text.insert(
+            "1.0",
+            "Choose a consensus simulation mode, run it locally, and optionally mint a reward block through the execution dev_mine API.",
+        )
+        self.mining_output_text.configure(state="disabled")
+
+    def _build_network_tab(self) -> None:
+        controls = ttk.LabelFrame(self.network_tab, text="Stack Discovery", padding=14)
+        controls.pack(fill="x")
+        ttk.Button(controls, text="Refresh Network Map", style="Primary.TButton", command=self.refresh_network_map).pack(side="left")
+        ttk.Label(
+            controls,
+            text="This inspects docker compose when possible and falls back to the configured topology from docker-compose.yml and .env.",
+            background=PALETTE["panel"],
+            foreground=PALETTE["muted"],
+        ).pack(side="left", padx=(12, 0))
+
+        content = ttk.Frame(self.network_tab)
+        content.pack(fill="both", expand=True, pady=(14, 0))
+
+        left = ttk.Frame(content)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(content)
+        right.pack(side="left", fill="both", expand=False, padx=(14, 0))
+
+        table_frame = ttk.LabelFrame(left, text="Service Status", padding=14)
+        table_frame.pack(fill="both", expand=True)
+        self.network_tree = ttk.Treeview(
+            table_frame,
+            columns=("service", "status", "role", "endpoint", "ips"),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, heading, width in (
+            ("service", "Service", 180),
+            ("status", "Status", 120),
+            ("role", "Role", 170),
+            ("endpoint", "Host Endpoint", 240),
+            ("ips", "Container IPs", 220),
+        ):
+            self.network_tree.heading(column, text=heading)
+            self.network_tree.column(column, width=width, anchor="w")
+        self.network_tree.pack(fill="both", expand=True)
+
+        canvas_frame = ttk.LabelFrame(right, text="Topology Diagram", padding=14)
+        canvas_frame.pack(fill="both", expand=False)
+        self.network_canvas = tk.Canvas(canvas_frame, width=420, height=640, bg=PALETTE["panel"], highlightthickness=0)
+        self.network_canvas.pack(fill="both", expand=True)
+
+        detail_frame = ttk.LabelFrame(right, text="Discovery Detail", padding=14)
+        detail_frame.pack(fill="both", expand=True, pady=(14, 0))
+        self.network_output_text = ScrolledText(detail_frame, width=50, height=20, wrap="word", font=("TkFixedFont", 9))
+        self.network_output_text.pack(fill="both", expand=True)
+        self.network_output_text.insert("1.0", "Refresh the network map to inspect the configured and currently running stack.")
+        self.network_output_text.configure(state="disabled")
 
     def _build_explorer_tab(self) -> None:
         controls = ttk.LabelFrame(self.explorer_tab, text="Lookup", padding=14)
@@ -863,12 +1439,15 @@ class BlockchainDesktopClient(tk.Tk):
             self.set_text(self.dev_accounts_text, "\n".join(lines).strip())
             if wallets:
                 self.transfer_sender_var.set(wallets[0].combo_label)
+                self.contract_sender_var.set(wallets[0].combo_label)
+                self.mining_wallet_var.set(wallets[0].combo_label)
                 self.call_from_var.set(wallets[0].address)
             if len(wallets) > 1:
                 self.transfer_to_var.set(wallets[1].address)
                 self.call_to_var.set(wallets[1].address)
             self.transfer_chain_id_var.set(str(self.dev_server.chain_id))
             self.refresh_dashboard()
+            self.refresh_network_map()
 
         self.run_background("Starting embedded devnet...", task, on_success=on_success)
 
@@ -879,6 +1458,7 @@ class BlockchainDesktopClient(tk.Tk):
 
         def on_success(_: None) -> None:
             self.set_text(self.dev_accounts_text, "Embedded devnet stopped.")
+            self.refresh_network_map()
 
         self.run_background("Stopping embedded devnet...", task, on_success=on_success)
 
@@ -914,6 +1494,8 @@ class BlockchainDesktopClient(tk.Tk):
         values = [profile.combo_label for profile in self.wallets.values()]
         self.transfer_sender_combo.configure(values=values)
         self.transfer_recipient_combo.configure(values=[profile.address for profile in self.wallets.values()])
+        self.contract_sender_combo.configure(values=values)
+        self.mining_wallet_combo.configure(values=[*values, *[profile.address for profile in self.wallets.values()]])
 
     def selected_wallet(self) -> WalletProfile | None:
         selection = self.wallet_tree.selection()
@@ -992,6 +1574,8 @@ class BlockchainDesktopClient(tk.Tk):
             messagebox.showinfo(APP_TITLE, "Select a wallet first.")
             return
         self.transfer_sender_var.set(profile.combo_label)
+        self.contract_sender_var.set(profile.combo_label)
+        self.mining_wallet_var.set(profile.combo_label)
         self.call_from_var.set(profile.address)
         self.set_status(f"Using {profile.label} as the current sender.")
 
@@ -1014,14 +1598,454 @@ class BlockchainDesktopClient(tk.Tk):
         self._refresh_wallet_choices()
         self.wallet_details_var.set("Wallet removed.")
 
+    def resolve_loaded_wallet(self, selected: str) -> WalletProfile | None:
+        normalized = selected.strip()
+        if not normalized:
+            return None
+        for profile in self.wallets.values():
+            if normalized == profile.combo_label or normalized == profile.address:
+                return profile
+        return None
+
     def resolve_sender_wallet(self) -> WalletProfile:
         selected = self.transfer_sender_var.get().strip()
         if not selected:
             raise ValueError("select a sender wallet")
-        for profile in self.wallets.values():
-            if profile.combo_label == selected or profile.address == selected:
-                return profile
+        profile = self.resolve_loaded_wallet(selected)
+        if profile is not None:
+            return profile
         raise ValueError("sender wallet is not loaded in the client")
+
+    def resolve_contract_wallet(self) -> WalletProfile:
+        selected = self.contract_sender_var.get().strip()
+        if not selected:
+            raise ValueError("select a contract signer wallet")
+        profile = self.resolve_loaded_wallet(selected)
+        if profile is not None:
+            return profile
+        raise ValueError("contract signer wallet is not loaded in the client")
+
+    def resolve_miner_address(self) -> str:
+        selected = self.mining_wallet_var.get().strip()
+        if not selected:
+            raise ValueError("select a miner wallet or enter an address")
+        profile = self.resolve_loaded_wallet(selected)
+        if profile is not None:
+            return profile.address
+        return Address.from_hex(selected).to_hex()
+
+    def browse_contract_source(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select Solidity Source",
+            initialdir=str(ROOT),
+            filetypes=(("Solidity", "*.sol"), ("All files", "*.*")),
+        )
+        if selected:
+            self.contract_source_var.set(selected)
+
+    def browse_contract_artifact(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select Compiled Contract Artifact",
+            initialdir=str(ROOT),
+            filetypes=(("Contract artifacts", "*.bin *.hex *.json"), ("All files", "*.*")),
+        )
+        if selected:
+            self.contract_artifact_var.set(selected)
+
+    def browse_contract_abi(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select Contract ABI",
+            initialdir=str(ROOT),
+            filetypes=(("ABI files", "*.abi *.json"), ("All files", "*.*")),
+        )
+        if selected:
+            self.contract_abi_var.set(selected)
+
+    def compile_contract_source(self) -> None:
+        source_path = self.contract_source_var.get().strip()
+        contract_name = self.contract_name_var.get().strip() or None
+        if not source_path:
+            messagebox.showinfo(APP_TITLE, "Select a Solidity source file first.")
+            return
+
+        def task() -> dict[str, str]:
+            return compile_solidity_source(source_path, contract_name=contract_name)
+
+        def on_success(payload: dict[str, str]) -> None:
+            self.contract_artifact_var.set(payload["artifactPath"])
+            self.contract_abi_var.set(payload["abiPath"])
+            if not self.contract_name_var.get().strip():
+                self.contract_name_var.set(payload["contractName"])
+            self.set_text(self.contract_output_text, pretty_json(payload))
+
+        self.run_background("Compiling Solidity source with solc...", task, on_success=on_success)
+
+    def load_contract_defaults(self) -> None:
+        try:
+            sender = self.resolve_contract_wallet()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+
+        def task() -> dict[int, object]:
+            client = self.require_client()
+            responses = client.batch(
+                [
+                    {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
+                    {"jsonrpc": "2.0", "id": 2, "method": "eth_gasPrice", "params": []},
+                    {"jsonrpc": "2.0", "id": 3, "method": "eth_maxPriorityFeePerGas", "params": []},
+                    {"jsonrpc": "2.0", "id": 4, "method": "eth_getBlockByNumber", "params": ["latest", False]},
+                    {"jsonrpc": "2.0", "id": 5, "method": "eth_getTransactionCount", "params": [sender.address, "pending"]},
+                ]
+            )
+            indexed: dict[int, object] = {}
+            for response in responses:
+                if "error" in response:
+                    error = response["error"]
+                    if isinstance(error, dict):
+                        raise RpcCallError(str(error.get("message", "RPC default lookup failed")), code=error.get("code"), data=error.get("data"))
+                    raise RpcCallError("RPC default lookup failed")
+                indexed[int(response["id"])] = response.get("result")
+            return indexed
+
+        def on_success(indexed: dict[int, object]) -> None:
+            chain_id = hex_quantity_to_int(indexed.get(1), default=1337)
+            gas_price = hex_quantity_to_int(indexed.get(2))
+            priority_fee = hex_quantity_to_int(indexed.get(3), default=max(gas_price, 1))
+            latest_block = indexed.get(4) if isinstance(indexed.get(4), dict) else {}
+            base_fee = hex_quantity_to_int(latest_block.get("baseFeePerGas"), default=0) if isinstance(latest_block, dict) else 0
+            max_fee = max(base_fee + (priority_fee * 2), priority_fee)
+
+            self.contract_chain_id_var.set(str(chain_id))
+            self.contract_gas_price_var.set(str(gas_price))
+            self.contract_priority_fee_var.set(str(priority_fee))
+            self.contract_max_fee_var.set(str(max_fee))
+            self.set_status(f"Loaded deploy defaults for nonce {hex_quantity_to_int(indexed.get(5))}.")
+
+        self.run_background("Loading contract deployment defaults...", task, on_success=on_success)
+
+    def _load_contract_artifact_from_form(self):
+        artifact_path = self.contract_artifact_var.get().strip()
+        if not artifact_path:
+            raise ValueError("contract artifact path is required")
+        contract_name = self.contract_name_var.get().strip() or None
+        artifact = load_contract_artifact(artifact_path, contract_name=contract_name)
+        abi_path = self.contract_abi_var.get().strip()
+        if abi_path:
+            artifact = artifact.with_abi(load_contract_abi(abi_path, contract_name=contract_name))
+        return artifact
+
+    def _contract_deployer_kwargs(self) -> dict[str, object]:
+        tx_type = "legacy" if self.contract_tx_type_var.get().strip() == "Legacy" else "eip1559"
+        kwargs: dict[str, object] = {
+            "tx_type": tx_type,
+            "gas_limit": parse_int_value(self.contract_gas_limit_var.get(), label="contract gas limit"),
+            "value": parse_int_value(self.contract_value_var.get(), label="contract value"),
+        }
+        if self.contract_chain_id_var.get().strip():
+            kwargs["chain_id"] = parse_int_value(self.contract_chain_id_var.get(), label="contract chain ID")
+        if self.contract_gas_price_var.get().strip():
+            kwargs["gas_price"] = parse_int_value(self.contract_gas_price_var.get(), label="contract gas price")
+        if self.contract_priority_fee_var.get().strip():
+            kwargs["max_priority_fee_per_gas"] = parse_int_value(self.contract_priority_fee_var.get(), label="contract max priority fee")
+        if self.contract_max_fee_var.get().strip():
+            kwargs["max_fee_per_gas"] = parse_int_value(self.contract_max_fee_var.get(), label="contract max fee")
+        return kwargs
+
+    def preview_contract_deploy(self) -> None:
+        try:
+            wallet = self.resolve_contract_wallet()
+            artifact = self._load_contract_artifact_from_form()
+            constructor_args = parse_json_array(self.contract_constructor_args_var.get().strip() or "[]", label="constructor args")
+            deploy_kwargs = self._contract_deployer_kwargs()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+
+        def task() -> dict[str, object]:
+            deployer = ContractDeployer.for_rpc_url(self.rpc_url_var.get().strip())
+            transaction, raw_transaction, predicted_address, nonce = deployer.build_deployment_transaction(
+                artifact,
+                private_key=wallet.private_key,
+                constructor_args=constructor_args,
+                **deploy_kwargs,
+            )
+            return {
+                "artifact": self.contract_artifact_var.get().strip(),
+                "contractName": artifact.contract_name,
+                "signer": wallet.address,
+                "constructorArgs": constructor_args,
+                "nonce": nonce,
+                "predictedContractAddress": predicted_address,
+                "transactionHash": transaction.tx_hash().to_hex(),
+                "rawTransaction": raw_transaction,
+                "txType": deploy_kwargs["tx_type"],
+            }
+
+        self.run_background(
+            "Building contract deployment transaction...",
+            task,
+            on_success=lambda payload: self.set_text(self.contract_output_text, pretty_json(payload)),
+        )
+
+    def deploy_contract(self) -> None:
+        try:
+            wallet = self.resolve_contract_wallet()
+            artifact = self._load_contract_artifact_from_form()
+            constructor_args = parse_json_array(self.contract_constructor_args_var.get().strip() or "[]", label="constructor args")
+            deploy_kwargs = self._contract_deployer_kwargs()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+
+        def task() -> dict[str, object]:
+            deployer = ContractDeployer.for_rpc_url(self.rpc_url_var.get().strip())
+            result = deployer.deploy_contract(
+                artifact,
+                private_key=wallet.private_key,
+                constructor_args=constructor_args,
+                **deploy_kwargs,
+            )
+            deployed_code = None
+            if result.receipt is not None and result.receipt.get("status") == "0x1":
+                deployed_code = deployer.client.call("eth_getCode", [result.contract_address, "latest"])
+            return {
+                "artifact": self.contract_artifact_var.get().strip(),
+                "contractName": artifact.contract_name,
+                "signer": wallet.address,
+                "constructorArgs": constructor_args,
+                "transactionHash": result.transaction_hash,
+                "contractAddress": result.contract_address,
+                "predictedContractAddress": result.predicted_contract_address,
+                "receipt": result.receipt,
+                "transaction": result.transaction,
+                "deployedCode": deployed_code,
+            }
+
+        def on_success(payload: dict[str, object]) -> None:
+            self.set_text(self.contract_output_text, pretty_json(payload))
+            self.tx_hash_var.set(str(payload["transactionHash"]))
+            self.call_to_var.set(str(payload["contractAddress"]))
+            self.call_from_var.set(wallet.address)
+            self.block_selector_var.set("latest")
+            self.refresh_dashboard()
+
+        self.run_background("Deploying smart contract...", task, on_success=on_success)
+
+    def _run_consensus_workload(self, algorithm: str) -> dict[str, object]:
+        if algorithm == "manual":
+            return {
+                "algorithm": algorithm,
+                "summary": "No local consensus simulation was requested before mining.",
+            }
+
+        if algorithm == "hybrid-beacon":
+            validators = parse_int_value(self.mining_validators_var.get(), label="validator count")
+            epochs = parse_int_value(self.mining_epochs_var.get(), label="epoch count")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                state = run_beacon_simulation(num_validators=validators, epochs=epochs)
+            return {
+                "algorithm": algorithm,
+                "validators": validators,
+                "epochs": epochs,
+                "finalEpoch": state.epoch,
+                "finalSlot": state.slot,
+                "latestBlockRoot": state.latest_block_root,
+                "justifiedCheckpoint": {
+                    "epoch": state.justified_checkpoint.epoch,
+                    "root": state.justified_checkpoint.root,
+                },
+                "finalizedCheckpoint": {
+                    "epoch": state.finalized_checkpoint.epoch,
+                    "root": state.finalized_checkpoint.root,
+                },
+                "stdout": buffer.getvalue().strip(),
+            }
+
+        nodes = parse_int_value(self.mining_nodes_var.get(), label="PBFT node count")
+        rounds = parse_int_value(self.mining_rounds_var.get(), label="PBFT rounds")
+        byzantine = parse_int_value(self.mining_byzantine_var.get(), label="PBFT byzantine count")
+        degree = parse_int_value(self.mining_degree_var.get(), label="PBFT degree")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            simulated_nodes = asyncio.run(
+                run_network_simulation(
+                    node_count=nodes,
+                    rounds=rounds,
+                    byzantine_count=byzantine,
+                    degree=degree,
+                )
+            )
+        honest_heads = len({node.head_hash for node in simulated_nodes if not node.malicious})
+        return {
+            "algorithm": algorithm,
+            "nodes": nodes,
+            "rounds": rounds,
+            "byzantine": byzantine,
+            "degree": degree,
+            "maxHeadHeight": max(node.head_height for node in simulated_nodes),
+            "honestHeadCount": honest_heads,
+            "samplePeers": {
+                str(node.node_id): {
+                    "region": node.region,
+                    "operator": node.operator_id,
+                    "endpoint": node.endpoint,
+                    "peerCount": len(node.peer_records),
+                }
+                for node in simulated_nodes[: min(4, len(simulated_nodes))]
+            },
+            "stdout": buffer.getvalue().strip(),
+        }
+
+    def run_consensus_only(self) -> None:
+        algorithm = self.mining_algorithm_var.get().strip() or "manual"
+
+        self.run_background(
+            f"Running {algorithm} consensus workload...",
+            lambda: self._run_consensus_workload(algorithm),
+            on_success=lambda payload: self.set_text(self.mining_output_text, pretty_json(payload)),
+        )
+
+    def mine_reward_block(self) -> None:
+        try:
+            miner_address = self.resolve_miner_address()
+            reward = parse_int_value(self.mining_reward_var.get(), label="reward amount")
+            count = parse_int_value(self.mining_count_var.get(), label="block count")
+            algorithm = self.mining_algorithm_var.get().strip() or "manual"
+            allow_empty = bool(self.mining_allow_empty_var.get())
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+
+        def task() -> dict[str, object]:
+            consensus_summary = self._run_consensus_workload(algorithm)
+            client = self.require_client()
+            options = {
+                "count": hex(count),
+                "reward": hex(reward),
+                "beneficiary": miner_address,
+                "allowEmpty": allow_empty,
+                "algorithm": algorithm,
+            }
+            try:
+                mined_blocks = client.call("dev_mine", [options])
+            except RpcCallError as exc:
+                if exc.code == -32601 and self.dev_server.running and self.rpc_url_var.get().strip() == self.dev_server.rpc_url:
+                    mined_blocks = self.dev_server.mine_blocks(
+                        beneficiary=miner_address,
+                        reward=reward,
+                        count=count,
+                        algorithm=algorithm,
+                    )
+                else:
+                    raise
+            miner_balance = client.call("eth_getBalance", [miner_address, "latest"])
+            latest_block = client.call("eth_getBlockByNumber", ["latest", False])
+            return {
+                "consensus": consensus_summary,
+                "minedBlocks": mined_blocks,
+                "miner": miner_address,
+                "latestBalance": miner_balance,
+                "latestBlock": latest_block,
+                "warning": "Consensus simulations are local research workloads. Reward issuance comes from the execution dev_mine extension.",
+            }
+
+        def on_success(payload: dict[str, object]) -> None:
+            self.set_text(self.mining_output_text, pretty_json(payload))
+            self.refresh_dashboard()
+
+        self.run_background("Running consensus workload and mining reward block...", task, on_success=on_success)
+
+    def refresh_network_map(self) -> None:
+        def task() -> StackSnapshot:
+            return inspect_stack_snapshot(dev_server=self.dev_server)
+
+        def on_success(snapshot: StackSnapshot) -> None:
+            for item_id in self.network_tree.get_children():
+                self.network_tree.delete(item_id)
+            for service in snapshot.services:
+                self.network_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        service.service,
+                        service.status,
+                        service.role,
+                        service.host_endpoint or "-",
+                        ", ".join(service.container_ips) if service.container_ips else "-",
+                    ),
+                )
+            lines = [
+                f"Compose Project: {snapshot.project_name}",
+                f"Host IPs: {', '.join(snapshot.host_ips)}",
+                "",
+            ]
+            if snapshot.discovery_error:
+                lines.extend(
+                    [
+                        "Docker discovery fallback:",
+                        snapshot.discovery_error,
+                        "",
+                    ]
+                )
+            for service in snapshot.services:
+                lines.extend(
+                    [
+                        f"{service.service} [{service.status}]",
+                        f"  Role: {service.role}",
+                        f"  Description: {service.description}",
+                        f"  Host Endpoint: {service.host_endpoint or '-'}",
+                        f"  Container: {service.container_name or '-'}",
+                        f"  Container IPs: {', '.join(service.container_ips) if service.container_ips else '-'}",
+                        f"  Networks: {', '.join(service.networks) if service.networks else '-'}",
+                        f"  Note: {service.note or '-'}",
+                        "",
+                    ]
+                )
+            self.set_text(self.network_output_text, "\n".join(lines).strip())
+            self._draw_network_map(snapshot)
+
+        self.run_background("Inspecting stack topology...", task, on_success=on_success)
+
+    def _draw_network_map(self, snapshot: StackSnapshot) -> None:
+        canvas = self.network_canvas
+        canvas.delete("all")
+
+        def box(x1: int, y1: int, x2: int, y2: int, title: str, detail: str, *, fill: str) -> tuple[float, float]:
+            canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=PALETTE["border"], width=2)
+            canvas.create_text((x1 + x2) / 2, y1 + 16, text=title, fill=PALETTE["text"], font=("TkDefaultFont", 10, "bold"))
+            canvas.create_text((x1 + x2) / 2, y1 + 40, text=detail, fill=PALETTE["muted"], font=("TkDefaultFont", 8), width=(x2 - x1 - 12))
+            return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+        host_center = box(130, 20, 290, 78, "Host / IDE", "\n".join(snapshot.host_ips[:3]), fill=PALETTE["surface"])
+        launcher_center = box(130, 108, 290, 166, "start.py / Compose", snapshot.project_name, fill=PALETTE["panel"])
+        rpc_center = box(130, 196, 290, 254, "Current RPC", self.rpc_url_var.get().strip() or "-", fill=PALETTE["surface"])
+        canvas.create_line(host_center[0], 78, launcher_center[0], 108, fill=PALETTE["accent"], width=2)
+        canvas.create_line(launcher_center[0], 166, rpc_center[0], 196, fill=PALETTE["accent"], width=2)
+
+        ordered = list(snapshot.services)
+        start_y = 300
+        left_x = 18
+        right_x = 218
+        for index, service in enumerate(ordered):
+            column_x = left_x if index % 2 == 0 else right_x
+            row_y = start_y + (index // 2) * 84
+            fill = PALETTE["surface"]
+            status_lower = service.status.lower()
+            if "running" in status_lower:
+                fill = "#e5f7ef"
+            elif any(token in status_lower for token in ("exit", "dead", "failed")):
+                fill = "#f8e6e1"
+            detail = "\n".join(
+                [
+                    service.role,
+                    service.host_endpoint or (service.container_ips[0] if service.container_ips else "container-only"),
+                    service.status,
+                ]
+            )
+            center = box(column_x, row_y, column_x + 184, row_y + 62, service.service, detail, fill=fill)
+            canvas.create_line(launcher_center[0], 166, center[0], row_y, fill=PALETTE["border"], width=1)
 
     def load_transaction_defaults(self) -> None:
         try:

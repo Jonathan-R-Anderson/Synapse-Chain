@@ -133,6 +133,9 @@ The HTTP transport uses JSON-RPC 2.0 over `POST`, supports batch requests, and i
 - `eth_sendRawTransaction`
 - `debug_traceCall`
 - `debug_traceTransaction`
+- `dev_getConfig`
+- `dev_setCoinbase`
+- `dev_mine`
 
 ### Tooling Notes
 
@@ -147,6 +150,19 @@ Hardhat / Foundry:
 - raw signed transaction submission works for legacy and EIP-1559 transactions already supported by the execution engine
 - receipts, transaction lookups, block lookup, storage reads, gas estimation, and debug traces are available
 - revert payloads from `eth_call` and `eth_estimateGas` are surfaced as JSON-RPC errors with revert data
+
+Developer extensions:
+
+- `dev_setCoinbase` changes the beneficiary used for later dev mining calls
+- `dev_mine` can force empty-block production and optionally credit a configurable block reward to the chosen beneficiary
+- these methods are intended for local-dev workflows and the graphical client, not Ethereum RPC compatibility
+
+I2P overlay for long-running demo nodes:
+
+- the `examples/container_node.py` roles can run with `EXECUTION_PRIVACY_NETWORK=i2p`
+- when enabled, the execution demo roles expose a JSON-over-stream sync overlay through an I2P SAM bridge instead of relying only on in-process fixture peers
+- the shared bootstrap destination file is controlled by `EXECUTION_I2P_BOOTSTRAP_FILE`
+- this currently applies to the execution demo roles, not the separate consensus simulator
 
 ## Contract Deployment Tooling
 

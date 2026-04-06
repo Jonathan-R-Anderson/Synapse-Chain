@@ -12,6 +12,7 @@ from rpc.compat import CompatibilityConfig
 from rpc.errors import internal_error, invalid_request, map_exception, method_not_found, parse_error
 from rpc.gas import GasEstimator
 from rpc.methods import RpcContext, RpcHandler
+from rpc.methods import dev as dev_methods
 from rpc.methods import debug as debug_methods
 from rpc.methods import eth as eth_methods
 from rpc.methods import net as net_methods
@@ -29,6 +30,7 @@ def build_method_table(context: RpcContext) -> dict[str, RpcHandler]:
     net_methods.register(methods)
     eth_methods.register(methods)
     debug_methods.register(methods)
+    dev_methods.register(methods)
     return methods
 
 

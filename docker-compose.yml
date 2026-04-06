@@ -1,8 +1,23 @@
 services:
+  i2p-router:
+    image: geti2p/i2p
+    env_file:
+      - .env
+    volumes:
+      - "${I2P_DATA_DIR}:/i2p/.i2p"
+    expose:
+      - "7656"
+      - "7657"
+    ports:
+      - "127.0.0.1:${I2P_CONSOLE_PORT}:7657"
+    restart: unless-stopped
+
   execution-rpc:
     build:
       context: .
       dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
     env_file:
       - .env
     environment:
@@ -21,6 +36,8 @@ services:
     build:
       context: .
       dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
     env_file:
       - .env
     environment:
@@ -35,6 +52,8 @@ services:
     build:
       context: .
       dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
     env_file:
       - .env
     environment:
@@ -49,6 +68,8 @@ services:
     build:
       context: .
       dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
     env_file:
       - .env
     environment:
@@ -63,11 +84,14 @@ services:
     build:
       context: .
       dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
     env_file:
       - .env
     environment:
       EXECUTION_STATE_ROOT: "${EXECUTION_STATE_ROOT}"
       EXECUTION_NODE_STATUS_INTERVAL: "${EXECUTION_NODE_STATUS_INTERVAL}"
+      EXECUTION_I2P_PUBLISH_DESTINATION: "true"
     command: ["python", "/app/execution/src/crates/execution/examples/container_node.py", "--mode", "bootnode", "--keep-alive"]
     volumes:
       - "${EXECUTION_DATA_DIR}:/var/lib/crypto/execution"
@@ -77,6 +101,8 @@ services:
     build:
       context: .
       dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
     env_file:
       - .env
     environment:
@@ -91,6 +117,8 @@ services:
     build:
       context: .
       dockerfile: execution/Dockerfile
+    depends_on:
+      - i2p-router
     env_file:
       - .env
     environment:
